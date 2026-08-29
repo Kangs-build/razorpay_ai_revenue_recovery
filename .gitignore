@@ -1,5 +1,55 @@
+# ============================================
+# Razorpay AI Revenue Recovery — .gitignore
+# ============================================
+
+# ----- Secrets & environment -----
 .env
-venv/
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ----- Python -----
 __pycache__/
-node_modules/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ----- Virtual environments -----
+venv/
+.venv/
+env/
+ENV/
+
+# ----- IDE / Editor -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+
+# ----- Testing & coverage -----
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# ----- Future: Node.js / Frontend -----
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+
+# ----- Jupyter -----
+.ipynb_checkpoints/
+
+# ----- OS -----
+.DS_Store
+Thumbs.db
