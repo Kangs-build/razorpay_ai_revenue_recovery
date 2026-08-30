@@ -371,6 +371,32 @@ def print_twin_report(incident: dict, options: list[RecoveryOption]) -> None:
     print()
 
 
+# ---------- INDIVIDUAL RECOVERY STRATEGY SELECTION ----------
+
+
+def select_individual_recovery_strategy(payment: dict) -> str:
+    """Select the best recovery strategy for a single failed payment.
+
+    Uses the same scoring logic as the Recovery Twin, but applied to
+    an individual payment's error_reason. For incident-level decisions,
+    use analyze_incident() instead.
+
+    Args:
+        payment: A simulated payment dict with error_reason.
+
+    Returns:
+        The highest-scoring strategy name.
+    """
+    # Build a minimal incident dict from the payment's error reason
+    reason = payment.get("error_reason", "none")
+    incident = {
+        "error_reason": reason,
+        "failure_rate": 100.0,  # single payment = 100% failure
+    }
+    options = analyze_incident(incident)
+    return options[0].strategy
+
+
 # ---------- INTEGRATION: run detector then twin ----------
 
 def run_twin_for_incident(incident: dict) -> list[RecoveryOption]:
