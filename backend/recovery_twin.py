@@ -34,6 +34,7 @@ STRATEGIES = [
     "RETRY_LATER",
     "SUGGEST_ALTERNATE_METHOD",
     "SEND_PAYMENT_LINK",
+    "CUSTOMER_RETRY",
 ]
 
 
@@ -213,6 +214,45 @@ def _score_send_payment_link(facts: dict) -> tuple[int, str]:
     return score, explanation
 
 
+def _score_customer_retry(facts: dict) -> tuple[int, str]:
+    """Score CUSTOMER_RETRY: prompt the customer to retry with correct details.
+
+    Best when: the failure is caused by incorrect customer input
+    (e.g., wrong OTP/PIN) that the customer can correct themselves.
+    Less useful when: the problem is on the bank side or a balance issue.
+    """
+    score = 40
+
+    if facts["is_user_error"]:
+        score += 35  # customer can fix this by entering correct OTP/PIN
+    if facts["is_temporary"]:
+        score -= 15  # bank issue — customer retry won't help
+    if facts["is_balance_issue"]:
+        score -= 10  # retrying with same low balance won't help
+    # Note: high_failure_rate is NOT penalized here. A single OTP payment
+    # naturally has 100% failure rate, which is expected, not systemic.
+
+    explanation = (
+        "The payment failed because the customer entered incorrect "
+        "authentication details. Allow the customer to retry the same "
+        "payment with the correct OTP/PIN before suggesting another "
+        "payment method."
+    )
+
+    if facts["is_user_error"]:
+        explanation += (
+            " This is a customer-correctable error, making a direct retry "
+            "the most appropriate next step."
+        )
+    elif facts["is_temporary"]:
+        explanation += (
+            " However, this failure appears to be a bank-side issue, so "
+            "waiting for resolution may be more effective."
+        )
+
+    return score, explanation
+
+
 # ---------- STEP 3: ANALYZE & RANK ----------
 
 _STRATEGY_SCORERS = {
@@ -220,6 +260,7 @@ _STRATEGY_SCORERS = {
     "RETRY_LATER": _score_retry_later,
     "SUGGEST_ALTERNATE_METHOD": _score_suggest_alternate,
     "SEND_PAYMENT_LINK": _score_send_payment_link,
+    "CUSTOMER_RETRY": _score_customer_retry,
 }
 
 _FRICTION_MAP = {
@@ -227,6 +268,7 @@ _FRICTION_MAP = {
     "RETRY_LATER": "Low",
     "SUGGEST_ALTERNATE_METHOD": "Medium",
     "SEND_PAYMENT_LINK": "Medium",
+    "CUSTOMER_RETRY": "Low",
 }
 
 _DUPLICATE_RISK_MAP = {
@@ -234,6 +276,7 @@ _DUPLICATE_RISK_MAP = {
     "RETRY_LATER": "Medium",
     "SUGGEST_ALTERNATE_METHOD": "Medium",
     "SEND_PAYMENT_LINK": "Medium",
+    "CUSTOMER_RETRY": "Low",
 }
 
 

@@ -77,11 +77,11 @@ TIMEOUT_INCIDENT = {
 # ======================================================================
 
 class TestAllStrategiesPresent(unittest.TestCase):
-    """Every analysis must produce exactly 4 strategies."""
+    """Every analysis must produce exactly 5 strategies."""
 
-    def test_four_strategies_returned(self):
+    def test_five_strategies_returned(self):
         options = analyze_incident(TECHNICAL_INCIDENT)
-        self.assertEqual(len(options), 4)
+        self.assertEqual(len(options), 5)
 
     def test_all_strategy_names_present(self):
         options = analyze_incident(TECHNICAL_INCIDENT)
@@ -158,6 +158,24 @@ class TestRecommendationIsHighest(unittest.TestCase):
 
 
 # ======================================================================
+# 5b. incorrect_otp prefers CUSTOMER_RETRY
+# ======================================================================
+
+class TestOtpPrefersCustomerRetry(unittest.TestCase):
+    """An incorrect-OTP failure should prefer CUSTOMER_RETRY over other strategies."""
+
+    def test_customer_retry_is_top_for_otp(self):
+        options = analyze_incident(OTP_INCIDENT)
+        self.assertEqual(options[0].strategy, "CUSTOMER_RETRY")
+
+    def test_customer_retry_scores_higher_than_suggest_alternate(self):
+        options = analyze_incident(OTP_INCIDENT)
+        cr = next(o for o in options if o.strategy == "CUSTOMER_RETRY")
+        sa = next(o for o in options if o.strategy == "SUGGEST_ALTERNATE_METHOD")
+        self.assertGreater(cr.score, sa.score)
+
+
+# ======================================================================
 # 5. Every option contains an explanation
 # ======================================================================
 
@@ -217,7 +235,7 @@ class TestIntegrationWithDetector(unittest.TestCase):
 
         # Analyze the first incident
         options = analyze_incident(incidents[0])
-        self.assertEqual(len(options), 4)
+        self.assertEqual(len(options), 5)
         self.assertGreaterEqual(options[0].score, 0)
         self.assertLessEqual(options[0].score, 100)
 
@@ -225,7 +243,7 @@ class TestIntegrationWithDetector(unittest.TestCase):
         """run_twin_for_incident should return a list of RecoveryOption."""
         options = run_twin_for_incident(TECHNICAL_INCIDENT)
         self.assertIsInstance(options, list)
-        self.assertEqual(len(options), 4)
+        self.assertEqual(len(options), 5)
         for opt in options:
             self.assertIsInstance(opt, RecoveryOption)
 

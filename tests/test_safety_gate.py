@@ -247,7 +247,7 @@ class TestIntegrationWithExistingComponents(unittest.TestCase):
             "revenue_at_risk": 19750.00,
         }
         options = analyze_incident(incident)
-        self.assertEqual(len(options), 4)
+        self.assertEqual(len(options), 5)
 
     def test_full_pipeline_detector_to_twin_to_gate(self):
         """Detect → Twin recommend → Gate check (normal case should pass)."""
