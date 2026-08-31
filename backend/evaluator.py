@@ -26,6 +26,13 @@ from incident_detector import detect_incidents, group_payments
 from recovery_twin import analyze_incident, select_individual_recovery_strategy
 from safety_gate import evaluate as safety_evaluate
 from baseline_policy import run_baseline
+from recovery_plan import (
+    ALL_PLANS,
+    simulate_recovery_plan,
+    score_plan,
+    get_incident_payments,
+    _plan_sort_key,
+)
 
 
 # ---------- DATASET GENERATION ----------
@@ -159,18 +166,14 @@ def _copy_payments(payments: list[dict]) -> list[dict]:
 
 def _is_late_success_candidate(payment: dict) -> bool:
     """Check if a payment is a late-success candidate (ID ends with 'L')."""
-    return payment.get("payment_id", "").endswith("L")
-
-
-# ---------- RECOVERY TWIN POLICY ----------
-
+    return payment.get("payment_id", "").endswith("L")# ---------- RECOVERY TWIN POLICY ----------
 
 def run_recovery_twin_policy(payments: list[dict]) -> list[dict]:
     """Run the full Recovery Twin pipeline on a batch of payments.
 
     1. Simulate late-success FIRST (so Safety Gate observes captured payments)
     2. Group payments and detect incidents
-    3. For incident failures: analyze with Recovery Twin, check gate, simulate
+    3. For incident failures: use multi-step recovery plans
     4. For individual failures: use select_individual_recovery_strategy
 
     Returns:
@@ -210,11 +213,10 @@ def run_recovery_twin_policy(payments: list[dict]) -> list[dict]:
     groups = group_payments(payments)
     incidents = detect_incidents(groups)
 
-    # Process incident payments
+    # Process incident payments using multi-step recovery plans
     for incident in incidents:
-        options = analyze_incident(incident)
-        strategy = options[0].strategy
-
+        # Collect the actual failed payment dicts for this incident
+        incident_payments_list = []
         for payment in payments:
             if payment.get("status") != "failed":
                 continue
@@ -224,30 +226,47 @@ def run_recovery_twin_policy(payments: list[dict]) -> list[dict]:
                 continue
             if payment.get("error_reason", "none") == "none":
                 continue
-
             pid = payment["payment_id"]
             if pid in processed_ids:
                 continue
-            processed_ids.add(pid)
+            incident_payments_list.append(payment)
 
+        if not incident_payments_list:
+            continue
+
+        # Use multi-step recovery: simulate the best plan on the incident
+        plan_results = []
+        for plan in ALL_PLANS:
+            pr = simulate_recovery_plan(incident_payments_list, plan)
+            plan_results.append((plan, pr, score_plan(pr)))
+        plan_results.sort(key=lambda x: x[2], reverse=True)
+        best_plan, best_result, best_score = plan_results[0]
+
+        # Record each payment's outcome from the best plan
+        plan_entry_map = {e["payment_id"]: e for e in best_result.per_payment}
+
+        for payment in incident_payments_list:
+            pid = payment["payment_id"]
+            processed_ids.add(pid)
             original_reason = payment.get("error_reason", "none")
-            gate_result = safety_evaluate(payment, strategy)
-            recovered = False
-            if gate_result["allowed"]:
-                before_status = payment["status"]
-                simulate_recovery(payment, strategy)
-                if payment["status"] != before_status:
-                    recovered = True
+            entry = plan_entry_map.get(pid, {})
+
+            # Determine customer-facing from the steps tried
+            cf = False
+            for step in entry.get("steps_tried", []):
+                if step["strategy"] in {"SUGGEST_ALTERNATE_METHOD", "SEND_PAYMENT_LINK"}:
+                    cf = True
+                    break
 
             results.append({
                 "payment_id": pid,
                 "amount": payment["amount"],
                 "error_reason": original_reason,
-                "strategy": strategy,
-                "gate_allowed": gate_result["allowed"],
-                "final_status": payment["status"],
-                "recovered": recovered,
-                "customer_facing": strategy in {"SUGGEST_ALTERNATE_METHOD", "SEND_PAYMENT_LINK"},
+                "strategy": best_plan.name,
+                "gate_allowed": not entry.get("blocked_by_gate", False),
+                "final_status": entry.get("final_status", payment["status"]),
+                "recovered": entry.get("recovered", False),
+                "customer_facing": cf,
                 "late_success_stop": False,
             })
 
@@ -452,12 +471,45 @@ def print_comparison(baseline: dict, twin: dict) -> None:
 
 
 def find_bank_x_incident_payments(payments: list[dict]) -> list[dict]:
-    """Find the BANK_X UPI incident payments in the dataset."""
+    """Find payments that belong to the detected BANK_X UPI incident.
+
+    Uses the Incident Detector's time-window logic: groups payments by
+    (bank, method), detects incidents via sliding window, then returns
+    only the failed payments that fall within the detected incident's
+    time window.
+    """
+    from datetime import timedelta
+
+    groups = group_payments(payments)
+    incidents = detect_incidents(groups)
+
+    # Find the BANK_X UPI incident
+    bx_incident = None
+    for inc in incidents:
+        if inc["bank"] == "BANK_X" and inc["payment_method"] == "UPI":
+            bx_incident = inc
+            break
+
+    if bx_incident is None:
+        return []
+
+    # Reconstruct the time window from the group
+    key = ("BANK_X", "UPI")
+    group_data = groups.get(key)
+    if not group_data:
+        return []
+
+    all_in_group = group_data["payments"]
+    if not all_in_group:
+        return []
+
+    window_start = all_in_group[0]["_dt"]
+    window_end = window_start + timedelta(minutes=5)  # TIME_WINDOW_MINUTES
+
+    # Return only failed payments within the incident time window
     return [
-        p for p in payments
-        if p["bank"] == "BANK_X"
-        and p["payment_method"] == "UPI"
-        and p.get("error_reason", "none") != "none"
+        p for p in all_in_group
+        if p["_dt"] <= window_end and p.get("status") == "failed"
     ]
 
 
@@ -466,7 +518,7 @@ def print_incident_comparison(
     baseline_results: list[dict],
     twin_results: list[dict],
 ) -> None:
-    """Show how baseline and Recovery Twin handle the BANK_X UPI incident."""
+    """Show how baseline and Multi-Step Recovery Twin handle the BANK_X UPI incident."""
     print()
     print("=" * 60)
     print("  INCIDENT-LEVEL COMPARISON: BANK_X UPI")
@@ -485,8 +537,8 @@ def print_incident_comparison(
     b_strategy = b_results[0]["strategy"] if b_results else "N/A"
     t_strategy = t_results[0]["strategy"] if t_results else "N/A"
 
-    print(f"  Baseline strategy:     {b_strategy}")
-    print(f"  Recovery Twin strategy: {t_strategy}")
+    print(f"  Baseline strategy:         {b_strategy}")
+    print(f"  Multi-Step Twin strategy:  {t_strategy}")
     print()
 
     # Revenue at risk for this incident
@@ -499,11 +551,32 @@ def print_incident_comparison(
     print(f"  Total payments in incident:   {len(incident_payments)}")
     print(f"  Revenue at risk:              {format_amount(total_risk)}")
     print()
-    print(f"  {'Metric':<30} {'Baseline':>12} {'Recovery Twin':>12}")
+    print(f"  {'Metric':<30} {'Baseline':>12} {'Multi-Step Twin':>12}")
     print(f"  {'─' * 54}")
     print(f"  {'Payments recovered':<30} {sum(1 for r in b_results if r['recovered']):>12} {sum(1 for r in t_results if r['recovered']):>12}")
     print(f"  {'Revenue recovered':<30} {format_amount(b_recovered):>12} {format_amount(t_recovered):>12}")
     print(f"  {'Actions blocked by gate':<30} {b_blocked:>12} {t_blocked:>12}")
+    print()
+
+    # Multi-step plan comparison for the incident
+    print("  MULTI-STEP PLAN COMPARISON (BANK_X UPI incident):")
+    print()
+    incident_failed = [p for p in incident_payments if p.get("status") == "failed"]
+    plan_results = []
+    for plan in ALL_PLANS:
+        pr = simulate_recovery_plan(incident_failed, plan)
+        plan_results.append((plan, pr, score_plan(pr)))
+    plan_results.sort(key=_plan_sort_key)
+
+    for plan, pr, sc in plan_results:
+        print(f"  {plan.name:<30} Recovered: {pr.recovered}/{pr.total_failed}  "
+              f"Revenue: {format_amount(pr.revenue_recovered)}  Score: {sc}/100")
+    print()
+
+    best_plan, best_pr, best_sc = plan_results[0]
+    print(f"  Best plan for this incident: {best_plan.name} ({best_sc}/100)")
+    print()
+    print("  All results above are SIMULATED RESULTS.")
     print()
 
 
@@ -625,15 +698,20 @@ def print_replay_results(incident_payments: list[dict]) -> None:
 
 
 def run_evaluation() -> None:
-    """Run the complete baseline vs Recovery Twin evaluation."""
+    """Run the complete baseline vs Multi-Step Recovery Twin evaluation."""
     print()
     print("=" * 60)
-    print("  BASELINE vs RECOVERY TWIN — SIMULATED EVALUATION")
+    print("  BASELINE vs MULTI-STEP RECOVERY TWIN — SIMULATED EVALUATION")
     print("=" * 60)
+    print()
+    print("  NOTE: All results below are SIMULATED RESULTS from a")
+    print("  controlled experiment. They do NOT represent real-world")
+    print("  recovery rates or production performance.")
 
     # Generate dataset
     dataset = generate_evaluation_dataset()
-    print(f"\n  Generated {len(dataset)} payment records.\n")
+    print(f"\n  Generated {len(dataset)} payment records.")
+    print(f"  Same starting payment batch used for both approaches.\n")
 
     # Fair replay: independent copies
     baseline_payments = _copy_payments(dataset)
@@ -643,7 +721,7 @@ def run_evaluation() -> None:
     baseline_results = run_baseline_policy(baseline_payments)
     baseline_metrics = calculate_metrics(baseline_payments, baseline_results)
 
-    # Run Recovery Twin
+    # Run Multi-Step Recovery Twin
     twin_results = run_recovery_twin_policy(twin_payments)
     twin_metrics = calculate_metrics(twin_payments, twin_results)
 
