@@ -24,6 +24,10 @@ from safety_gate import (
 )
 from payment_simulator import simulate_recovery, simulate_late_success
 
+# ---------- AI CONTEXT CONFIGURATION ----------
+
+AI_CONTEXT_MAX_BONUS = 10  # Maximum points AI context can add to a plan score
+
 # ---------- RECOVERY PLANS ----------
 
 
@@ -34,6 +38,8 @@ class RecoveryPlan:
     name: str
     description: str
     steps: list[str]  # list of strategy names, tried in order
+    first_step_is_wait: bool = False  # does the plan start with WAIT_AND_RECHECK?
+    avoids_immediate_customer_contact: bool = False  # no customer-facing step before 2nd step
 
 
 # Four predefined plans
@@ -41,24 +47,32 @@ PLAN_A_SAFE_WAIT = RecoveryPlan(
     name="PLAN_A_SAFE_WAIT",
     description="Wait first, then escalate carefully",
     steps=["WAIT_AND_RECHECK", "RETRY_LATER", "SUGGEST_ALTERNATE_METHOD"],
+    first_step_is_wait=True,
+    avoids_immediate_customer_contact=True,
 )
 
 PLAN_B_FAST_RECOVERY = RecoveryPlan(
     name="PLAN_B_FAST_RECOVERY",
     description="Skip waiting, retry immediately then escalate",
     steps=["RETRY_LATER", "SUGGEST_ALTERNATE_METHOD"],
+    first_step_is_wait=False,
+    avoids_immediate_customer_contact=False,
 )
 
 PLAN_C_CUSTOMER_ALTERNATE = RecoveryPlan(
     name="PLAN_C_CUSTOMER_ALTERNATE",
     description="Wait, then escalate to customer-facing actions",
     steps=["WAIT_AND_RECHECK", "SUGGEST_ALTERNATE_METHOD", "SEND_PAYMENT_LINK"],
+    first_step_is_wait=True,
+    avoids_immediate_customer_contact=False,
 )
 
 PLAN_D_CONSERVATIVE = RecoveryPlan(
     name="PLAN_D_CONSERVATIVE",
     description="Wait and retry only — minimal customer disturbance",
     steps=["WAIT_AND_RECHECK", "RETRY_LATER"],
+    first_step_is_wait=True,
+    avoids_immediate_customer_contact=True,
 )
 
 ALL_PLANS = [PLAN_A_SAFE_WAIT, PLAN_B_FAST_RECOVERY, PLAN_C_CUSTOMER_ALTERNATE, PLAN_D_CONSERVATIVE]
@@ -285,23 +299,62 @@ def score_explanation(result: PlanResult) -> str:
         f"    Customer Penalty:     {result.customer_facing_actions} actions × -2 → "
         f"{customer_penalty} pts",
     ]
-    return "\n".join(lines)# ---------- DETERMINISTIC TIE-BREAKING ----------
+    return "\n".join(lines)# ---------- AI CONTEXT BONUS ----------
+
+
+def calculate_context_bonus(plan: RecoveryPlan, context) -> int:
+    """Calculate a small context-fit bonus for a plan given AI context.
+
+    Args:
+        plan: A RecoveryPlan with trait flags.
+        context: A RecoveryContext from ai_diagnoser (or None for no bonus).
+
+    Returns:
+        Integer bonus from 0 to AI_CONTEXT_MAX_BONUS.
+    """
+    if context is None:
+        return 0
+
+    bonus = 0
+
+    # +5 if plan starts with wait-first and context prefers it
+    if context.prefer_wait_first and plan.first_step_is_wait:
+        bonus += 5
+
+    # +3 if plan avoids immediate customer contact and context prefers it
+    if context.avoid_immediate_customer_contact and plan.avoids_immediate_customer_contact:
+        bonus += 3
+
+    # +2 if plan prefers status recheck and context prefers it
+    if context.prefer_status_recheck and plan.first_step_is_wait:
+        bonus += 2
+
+    # Cap at maximum
+    return min(bonus, AI_CONTEXT_MAX_BONUS)
+
+
+# ---------- DETERMINISTIC TIE-BREAKING ----------
 
 
 def _plan_sort_key(plan_result_tuple: tuple) -> tuple:
     """Return a sort key that implements deterministic tie-breaking.
 
+    Expects tuple of (plan, result, final_score) where final_score
+    already includes any AI context bonus.
+
     Tie-break order:
-      1. Higher score wins
+      1. Higher final score wins
       2. Fewer recovery steps (shorter plan)
       3. Fewer customer-facing actions
       4. Fewer total recovery attempts
       5. Alphabetical by plan name
     """
-    plan, result, score = plan_result_tuple
-    # Negate score (higher is better), others (lower is better)
+    plan = plan_result_tuple[0]
+    result = plan_result_tuple[1]
+    final_score = plan_result_tuple[2]
+    # Negate score (higher is better), others (lower are better)
     return (
-        -score,
+        -final_score,
         len(plan.steps),
         result.customer_facing_actions,
         result.recovery_attempts,
@@ -390,10 +443,12 @@ def run_demo(
     payments: list[dict] | None = None,
     bank: str = "BANK_X",
     method: str = "UPI",
+    ai_context=None,  # RecoveryContext from ai_diagnoser, or None
 ) -> None:
     """Run the Multi-Step Recovery Twin demo.
 
     If payments is None, generates a bank incident using the simulator.
+    If ai_context is provided, applies a small context-fit bonus.
     """
     if payments is None:
         from payment_simulator import generate_bank_incident
@@ -408,6 +463,8 @@ def run_demo(
     # Calculate revenue at risk
     total_risk = sum(p["amount"] for p in incident_payments)
 
+    has_context = ai_context is not None
+
     print()
     print("=" * 60)
     print("  MULTI-STEP INCIDENT RECOVERY TWIN")
@@ -418,17 +475,28 @@ def run_demo(
     print(f"  Revenue At Risk: {_format_amount(total_risk)}")
     print(f"  Failed Payments: {len(incident_payments)}")
     print()
+
+    if has_context:
+        print("  AI CONTEXT: Verified diagnosis applied")
+        print(f"    {ai_context.description}")
+        print()
+    else:
+        print("  AI CONTEXT: None — using purely deterministic scoring")
+        print()
+
     print("  SIMULATED RESULTS — Each plan replayed independently")
     print()
 
-    # Simulate each plan
+    # Simulate each plan and apply context bonus
     results = []
     for plan in ALL_PLANS:
         result = simulate_recovery_plan(incident_payments, plan)
-        score = score_plan(result)
-        results.append((plan, result, score))
+        base_score = score_plan(result)
+        context_bonus = calculate_context_bonus(plan, ai_context)
+        final_score = min(100, base_score + context_bonus)
+        results.append((plan, result, final_score, base_score, context_bonus))
 
-    # Sort with deterministic tie-breaking
+    # Sort with deterministic tie-breaking (uses final_score at index 2)
     results.sort(key=_plan_sort_key)
 
     # Detect and explain ties
@@ -444,7 +512,7 @@ def run_demo(
             break  # only explain against the winner
 
     # Print each plan
-    for i, (plan, result, score) in enumerate(results, 1):
+    for i, (plan, result, final_score, base_score, ctx_bonus) in enumerate(results, 1):
         print(f"  PLAN {i} — {plan.name}")
         print(f"  {plan.description}")
         print(f"  Steps: {' → '.join(plan.steps)}")
@@ -456,13 +524,18 @@ def run_demo(
         print(f"  Customer-facing:       {result.customer_facing_actions}")
         print(f"  Safety Blocks:         {result.blocked_by_gate}")
         print(f"  Late-success Stops:    {result.late_success_stops}")
-        print(f"  Plan Score:            {score}/100")
+        if ctx_bonus > 0:
+            print(f"  Simulation Score:      {base_score}/100")
+            print(f"  AI Context Bonus:      +{ctx_bonus}")
+            print(f"  Final Plan Score:      {final_score}/100")
+        else:
+            print(f"  Plan Score:            {final_score}/100")
         print()
         print(score_explanation(result))
         print()
 
     # Recommendation
-    best_plan, best_result, best_score = results[0]
+    best_plan, best_result, best_score, best_base, best_bonus = results[0]
     print("  " + "─" * 50)
     print()
     print(f"  RECOMMENDED PLAN:")
@@ -489,32 +562,38 @@ def run_demo(
 
 def run_multi_step_incident_recovery(
     incident_payments: list[dict],
+    ai_context=None,  # RecoveryContext from ai_diagnoser, or None
 ) -> dict:
     """Run multi-step recovery on incident payments and return the best plan.
 
     Used by the evaluator to compare against the baseline.
+    If ai_context is provided, applies a small context-fit bonus.
 
     Returns:
         {
             "plan": RecoveryPlan,
             "result": PlanResult,
             "score": int,
-            "all_results": list of (plan, result, score) tuples
+            "all_results": list of (plan, result, final_score, base_score, ctx_bonus) tuples
         }
     """
     results = []
     for plan in ALL_PLANS:
         result = simulate_recovery_plan(incident_payments, plan)
-        score_val = score_plan(result)
-        results.append((plan, result, score_val))
+        base_score = score_plan(result)
+        ctx_bonus = calculate_context_bonus(plan, ai_context)
+        final_score = min(100, base_score + ctx_bonus)
+        results.append((plan, result, final_score, base_score, ctx_bonus))
 
     results.sort(key=_plan_sort_key)
-    best_plan, best_result, best_score = results[0]
+    best_plan, best_result, best_score, best_base, best_bonus = results[0]
 
     return {
         "plan": best_plan,
         "result": best_result,
         "score": best_score,
+        "base_score": best_base,
+        "context_bonus": best_bonus,
         "all_results": results,
     }
 

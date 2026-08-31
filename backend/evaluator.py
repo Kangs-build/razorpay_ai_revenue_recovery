@@ -565,15 +565,16 @@ def print_incident_comparison(
     plan_results = []
     for plan in ALL_PLANS:
         pr = simulate_recovery_plan(incident_failed, plan)
-        plan_results.append((plan, pr, score_plan(pr)))
+        base_sc = score_plan(pr)
+        plan_results.append((plan, pr, base_sc, base_sc, 0))  # no AI context in evaluator
     plan_results.sort(key=_plan_sort_key)
 
-    for plan, pr, sc in plan_results:
+    for plan, pr, final_sc, base_sc, ctx_bonus in plan_results:
         print(f"  {plan.name:<30} Recovered: {pr.recovered}/{pr.total_failed}  "
-              f"Revenue: {format_amount(pr.revenue_recovered)}  Score: {sc}/100")
+              f"Revenue: {format_amount(pr.revenue_recovered)}  Score: {final_sc}/100")
     print()
 
-    best_plan, best_pr, best_sc = plan_results[0]
+    best_plan, best_pr, best_sc, _, _ = plan_results[0]
     print(f"  Best plan for this incident: {best_plan.name} ({best_sc}/100)")
     print()
     print("  All results above are SIMULATED RESULTS.")

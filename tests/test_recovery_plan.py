@@ -366,6 +366,92 @@ class TestCustomerFacingTracking(unittest.TestCase):
 
 
 # =====================================================================
+# 15. AI Context Integration
+# =====================================================================
+
+
+class TestAIContextBonus(unittest.TestCase):
+    """Test that AI context provides a small, bounded bonus to plan scores."""
+
+    def test_no_context_gives_zero_bonus(self):
+        from recovery_plan import calculate_context_bonus
+        bonus = calculate_context_bonus(PLAN_D_CONSERVATIVE, None)
+        self.assertEqual(bonus, 0)
+
+    def test_bank_degradation_prefers_wait_first(self):
+        from recovery_plan import calculate_context_bonus
+        from ai_diagnoser import RecoveryContext
+        ctx = RecoveryContext(
+            prefer_wait_first=True,
+            avoid_immediate_customer_contact=True,
+            prefer_status_recheck=True,
+            description="test",
+        )
+        # PLAN_D: wait-first + avoids customer contact → should get bonus
+        bonus_d = calculate_context_bonus(PLAN_D_CONSERVATIVE, ctx)
+        # PLAN_B: not wait-first, not avoids customer → should get 0
+        bonus_b = calculate_context_bonus(PLAN_B_FAST_RECOVERY, ctx)
+        self.assertGreater(bonus_d, bonus_b)
+
+    def test_context_bonus_never_exceeds_max(self):
+        from recovery_plan import calculate_context_bonus, AI_CONTEXT_MAX_BONUS
+        from ai_diagnoser import RecoveryContext
+        # Maximum possible context
+        ctx = RecoveryContext(
+            prefer_wait_first=True,
+            avoid_immediate_customer_contact=True,
+            prefer_status_recheck=True,
+            description="test",
+        )
+        for plan in ALL_PLANS:
+            bonus = calculate_context_bonus(plan, ctx)
+            self.assertLessEqual(bonus, AI_CONTEXT_MAX_BONUS)
+
+    def test_final_score_capped_at_100(self):
+        from recovery_plan import simulate_recovery_plan, score_plan, calculate_context_bonus
+        from ai_diagnoser import RecoveryContext
+        payments = generate_bank_incident()
+        failed = [p for p in payments if p["status"] == "failed"]
+        ctx = RecoveryContext(
+            prefer_wait_first=True,
+            avoid_immediate_customer_contact=True,
+            prefer_status_recheck=True,
+            description="test",
+        )
+        for plan in ALL_PLANS:
+            result = simulate_recovery_plan(failed, plan)
+            base = score_plan(result)
+            bonus = calculate_context_bonus(plan, ctx)
+            final = min(100, base + bonus)
+            self.assertLessEqual(final, 100)
+            self.assertGreaterEqual(final, 0)
+
+    def test_multi_step_recovery_with_context(self):
+        from recovery_plan import run_multi_step_incident_recovery
+        from ai_diagnoser import RecoveryContext
+        payments = generate_bank_incident()
+        failed = [p for p in payments if p["status"] == "failed"]
+        ctx = RecoveryContext(
+            prefer_wait_first=True,
+            avoid_immediate_customer_contact=True,
+            prefer_status_recheck=True,
+            description="test",
+        )
+        output = run_multi_step_incident_recovery(failed, ai_context=ctx)
+        self.assertIn("context_bonus", output)
+        self.assertIn("base_score", output)
+        self.assertGreaterEqual(output["context_bonus"], 0)
+
+    def test_multi_step_recovery_without_context(self):
+        from recovery_plan import run_multi_step_incident_recovery
+        payments = generate_bank_incident()
+        failed = [p for p in payments if p["status"] == "failed"]
+        output = run_multi_step_incident_recovery(failed, ai_context=None)
+        self.assertEqual(output["context_bonus"], 0)
+        self.assertEqual(output["base_score"], output["score"])
+
+
+# =====================================================================
 # RUN
 # =====================================================================
 
