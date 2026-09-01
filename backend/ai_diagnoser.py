@@ -7,6 +7,10 @@ likely root cause of a payment incident. The AI only diagnoses and explains
 
 Flow:
     Incident Detector → AI Diagnosis → Evidence Verification → Recovery Twin
+
+Providers:
+    - Mock: deterministic, no API key needed, used in tests
+    - Real: OpenAI-compatible API, requires AI_DIAGNOSER_API_KEY env var
 """
 
 from __future__ import annotations
@@ -14,9 +18,62 @@ from __future__ import annotations
 import os
 import sys
 import json
-from dataclasses import dataclass
+import time
+import urllib.request
+import urllib.error
+from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# ---------- .env LOADING ----------
+
+
+def _load_env_file(path: str | None = None) -> None:
+    """Load a .env file into os.environ without overriding existing values.
+
+    This is a minimal parser for simple KEY=VALUE lines.
+    Lines starting with # or blank lines are ignored.
+    Values may be optionally quoted with single or double quotes.
+    Only sets variables that are NOT already in the environment,
+    so explicit shell exports always win.
+
+    Args:
+        path: Path to .env file. Defaults to .env in the project root
+              (two directories up from this file, i.e. the repository root).
+    """
+    if path is None:
+        # Project root = backend/../ = one level up from where this file lives
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(project_root, ".env")
+
+    if not os.path.isfile(path):
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                # Remove surrounding quotes
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                # Only set if not already in environment (explicit exports win)
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except (OSError, UnicodeDecodeError):
+        # If .env can't be read, silently continue — env vars may come from shell
+        pass
+
+
+# Load .env at import time so AI_DIAGNOSER_* vars are available
+_load_env_file()
+
 
 # ---------- DATA MODEL ----------
 
@@ -30,7 +87,7 @@ class Diagnosis:
     confidence: str  # "high" / "medium" / "low"
     evidence: list[str]
     short_explanation: str
-    is_mock: bool = False  # True when using mock provider
+    provider_used: str = "mock"  # "mock" / "real_llm" / "mock_fallback"
 
 
 @dataclass
@@ -128,15 +185,292 @@ def _mock_diagnose(incident: dict) -> dict:
     }
 
 
-# ---------- REAL LLM PROVIDER (placeholder) ----------
+# ---------- REAL LLM PROVIDER ----------
+
+# Default API configuration
+_DEFAULT_API_BASE = "https://api.openai.com/v1"
+_DEFAULT_MODEL = "gpt-4o-mini"
+_DEFAULT_TIMEOUT = 30  # seconds
+_MAX_RESPONSE_CHARS = 8000
+
+# ---------- JSON SCHEMA FOR STRUCTURED OUTPUT ----------
+
+_DIAGNOSIS_JSON_SCHEMA = {
+    "name": "payment_diagnosis",
+    "strict": True,
+    "description": "Structured diagnosis of a payment incident",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "likely_root_cause": {
+                "type": "string",
+                "description": "The likely root cause of the incident",
+                "enum": [
+                    "temporary_bank_degradation",
+                    "payment_method_outage",
+                    "merchant_configuration_error",
+                    "customer_data_issue",
+                    "connector_timeout",
+                    "rate_limiting",
+                    "fraud_detection_trigger",
+                    "insufficient_funds_cluster",
+                    "authentication_system_failure",
+                    "unknown",
+                ],
+            },
+            "incident_scope": {
+                "type": "string",
+                "description": "Scope of the incident in BANK_METHOD format, e.g. BANK_X_UPI",
+            },
+            "confidence": {
+                "type": "string",
+                "description": "Confidence level: high, medium, or low",
+                "enum": ["high", "medium", "low"],
+            },
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of evidence points supporting the diagnosis",
+            },
+            "short_explanation": {
+                "type": "string",
+                "description": "1-2 sentence explanation of the diagnosis",
+            },
+        },
+        "required": [
+            "likely_root_cause",
+            "incident_scope",
+            "confidence",
+            "evidence",
+            "short_explanation",
+        ],
+        "additionalProperties": False,
+    },
+}
+
+_SYSTEM_PROMPT = """You are a payment incident analyst for a fintech company.
+Given summarized payment incident data, diagnose the likely root cause.
+
+You MUST return ONLY a valid JSON object with these exact fields:
+{
+  "likely_root_cause": "<one of: temporary_bank_degradation, payment_method_outage, merchant_configuration_error, customer_data_issue, connector_timeout, rate_limiting, fraud_detection_trigger, insufficient_funds_cluster, authentication_system_failure, unknown>",
+  "incident_scope": "<BANK_METHOD format, e.g. BANK_X_UPI>",
+  "confidence": "<high, medium, or low>",
+  "evidence": ["<evidence point 1>", "<evidence point 2>", ...],
+  "short_explanation": "<1-2 sentence explanation>"
+}
+
+Rules:
+- evidence must be a list of strings supported by the incident data
+- confidence: high if failure_rate >= 70%, medium if >= 50%, low otherwise
+- incident_scope must match the affected bank and method
+- Do NOT include any text outside the JSON object
+- Do NOT execute any payment actions
+"""
+
+
+def _build_user_message(incident: dict) -> str:
+    """Build a concise user message from incident data for the LLM."""
+    bank = incident.get("bank", "unknown")
+    method = incident.get("payment_method", "unknown")
+    error = incident.get("error_reason", "unknown")
+    failed = incident.get("failed_payments", 0)
+    total = incident.get("total_payments", 0)
+    rate = incident.get("failure_rate", 0)
+    revenue = incident.get("revenue_at_risk", 0)
+
+    # Include time-window if available
+    time_info = ""
+    if "time_window_minutes" in incident:
+        time_info = f"\nTime window: {incident['time_window_minutes']} minutes"
+    elif "start_time" in incident and "end_time" in incident:
+        time_info = (
+            f"\nTime window: {incident.get('start_time', '?')} to "
+            f"{incident.get('end_time', '?')}"
+        )
+
+    return (
+        f"Payment incident data:\n"
+        f"- Affected bank: {bank}\n"
+        f"- Payment method: {method}\n"
+        f"- Failure rate: {rate}%\n"
+        f"- Failed payments: {failed} of {total}\n"
+        f"- Dominant error: {error}\n"
+        f"- Revenue at risk: {revenue}{time_info}\n"
+        f"\nDiagnose the likely root cause and return structured JSON."
+    )
+
+
+def _call_llm_api(
+    api_key: str,
+    api_base: str,
+    model: str,
+    user_message: str,
+    timeout: int,
+) -> str:
+    """Make a single LLM API call using OpenAI-compatible chat completions.
+
+    Uses only stdlib urllib — no external HTTP library required.
+
+    Returns:
+        The assistant's response text.
+
+    Raises:
+        RuntimeError: On API errors, timeouts, or invalid responses.
+    """
+    url = f"{api_base.rstrip('/')}/chat/completions"
+
+    payload_dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0,
+        "max_tokens": 2000,
+        "stream": False,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": _DIAGNOSIS_JSON_SCHEMA,
+        },
+        "provider": {
+            "require_parameters": True,
+        },
+    }
+
+    # Try to disable reasoning/thinking to save output tokens for the
+    # actual JSON diagnosis.  Not all providers support this — if the
+    # provider rejects it the caller will fall back to mock anyway.
+    payload_dict["reasoning"] = {"effort": "none", "exclude": True}
+
+    payload = json.dumps(payload_dict).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")[:_MAX_RESPONSE_CHARS]
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")[:200]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"LLM API returned HTTP {e.code}: {error_body}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"LLM API connection failed: {e.reason}"
+        ) from e
+    except TimeoutError:
+        raise RuntimeError(
+            f"LLM API call timed out after {timeout}s"
+        )
+
+    # Parse the outer OpenRouter/OpenAI response body
+    try:
+        response_json = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"LLM API returned invalid JSON: {e}") from e
+
+    # Debug info (never prints API key)
+    returned_model = response_json.get("model", "unknown")
+    choices = response_json.get("choices", [])
+    if choices:
+        _finish = choices[0].get("finish_reason", "unknown")
+        _content_len = len(choices[0].get("message", {}).get("content", ""))
+        print(f"  ℹ️  OpenRouter response: model={returned_model}  "
+              f"finish_reason={_finish}  content_length={_content_len}")
+    else:
+        print(f"  ℹ️  OpenRouter response: model={returned_model}  (no choices)")
+
+    # Extract assistant message content from choices[0].message.content
+    if not choices:
+        raise RuntimeError("LLM API returned no choices")
+
+    choice = choices[0]
+    finish_reason = choice.get("finish_reason", "")
+
+    # Check for truncation
+    if finish_reason == "length":
+        raise RuntimeError(
+            "REAL LLM RESPONSE TRUNCATED — USING MOCK FALLBACK  "
+            f"(model={returned_model}, finish_reason=length)"
+        )
+
+    content = choice.get("message", {}).get("content", "")
+    if not content:
+        raise RuntimeError("LLM API returned empty message content")
+
+    return content.strip()
+
+
+def _parse_llm_response(response_text: str) -> dict | None:
+    """Parse the LLM response text into a structured dict.
+
+    Handles cases where the LLM wraps JSON in markdown code blocks
+    or adds extra text around the JSON.
+
+    Returns:
+        Parsed dict or None if parsing fails.
+    """
+    text = response_text.strip()
+
+    # Try to extract JSON from markdown code blocks
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            cleaned = part.strip()
+            # Remove language prefix (json, etc.)
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:].strip()
+            elif cleaned.startswith("JSON"):
+                cleaned = cleaned[3:].strip()
+            try:
+                return json.loads(cleaned)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    # Try direct JSON parse
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try to find JSON object in text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return None
 
 
 def _real_diagnose(incident: dict, api_key: str | None = None) -> dict:
-    """Real LLM diagnosis using an API.
+    """Real LLM diagnosis using an OpenAI-compatible API.
 
-    This is a placeholder for future LLM integration.
-    Requires an API key via environment variable.
-    Raises RuntimeError if API key is not available.
+    Sends summarized incident data to the LLM and parses the structured
+    response. Falls back to RuntimeError if any step fails — the caller
+    (diagnose_incident) handles fallback to mock behavior.
+
+    Requires:
+        - AI_DIAGNOSER_API_KEY environment variable (or api_key param)
+        - Network access to the LLM API endpoint
+
+    Environment variables:
+        - AI_DIAGNOSER_API_KEY: API key (required)
+        - AI_DIAGNOSER_API_BASE: Custom API base URL (optional, defaults to OpenAI)
+        - AI_DIAGNOSER_MODEL: Model name (optional, defaults to gpt-4o-mini)
+        - AI_DIAGNOSER_TIMEOUT: Timeout in seconds (optional, defaults to 30)
     """
     key = api_key or os.environ.get("AI_DIAGNOSER_API_KEY")
     if not key:
@@ -145,13 +479,25 @@ def _real_diagnose(incident: dict, api_key: str | None = None) -> dict:
             "Set it to use the real LLM provider."
         )
 
-    # Future: call OpenAI / Anthropic / etc.
-    # For now, this is a stub that raises if the key exists but
-    # no real implementation is wired up.
-    raise NotImplementedError(
-        "Real LLM provider not yet implemented. "
-        "Set AI_DIAGNOSER_API_KEY and implement _real_diagnose()."
-    )
+    api_base = os.environ.get("AI_DIAGNOSER_API_BASE", _DEFAULT_API_BASE)
+    model = os.environ.get("AI_DIAGNOSER_MODEL", _DEFAULT_MODEL)
+    timeout = int(os.environ.get("AI_DIAGNOSER_TIMEOUT", str(_DEFAULT_TIMEOUT)))
+
+    # Build the user message from incident data
+    user_message = _build_user_message(incident)
+
+    # Call the LLM API
+    response_text = _call_llm_api(key, api_base, model, user_message, timeout)
+
+    # Parse the response
+    raw = _parse_llm_response(response_text)
+    if raw is None:
+        raise RuntimeError(
+            f"Could not parse LLM response as JSON: "
+            f"{response_text[:200]}"
+        )
+
+    return raw
 
 
 # ---------- PROVIDER SELECTOR ----------
@@ -167,9 +513,9 @@ def _get_provider():
     api_key = os.environ.get("AI_DIAGNOSER_API_KEY")
 
     if mock_env == "true" or not api_key:
-        return _mock_diagnose, True  # (provider_function, is_mock)
+        return _mock_diagnose, "mock"  # (provider_function, provider_used)
     else:
-        return _real_diagnose, False
+        return _real_diagnose, "real_llm"
 
 
 # ---------- DIAGNOSIS VALIDATION ----------
@@ -385,30 +731,43 @@ def diagnose_incident(incident: dict, is_mock: bool = True) -> tuple[Diagnosis, 
 
     Returns:
         (Diagnosis, Verification) tuple.
+
+    Error handling:
+        If the real provider fails (API error, timeout, malformed response,
+        missing key), falls back to mock-safe diagnosis and logs the fallback.
     """
+    provider_used = "mock"  # default
+
     if is_mock:
         provider = _mock_diagnose
-        mock_mode = True
     else:
-        provider, mock_mode = _get_provider()
+        provider, provider_used = _get_provider()
 
     # Get raw diagnosis from provider
-    raw = provider(incident)
+    try:
+        raw = provider(incident)
+    except (RuntimeError, NotImplementedError) as e:
+        # Real provider failed — fall back to mock
+        print(f"  ⚠️  LLM provider failed: {e}")
+        print(f"  ⚠️  REAL LLM FAILED — USING MOCK FALLBACK")
+        raw = _mock_diagnose(incident)
+        provider_used = "mock_fallback"
 
     # Validate the response
     diagnosis = _validate_diagnosis(raw)
     if diagnosis is None:
         # Malformed response — return a safe fallback
+        print(f"  ⚠️  AI response was malformed. Using safe fallback diagnosis.")
         diagnosis = Diagnosis(
             likely_root_cause="unknown",
             incident_scope="unknown",
             confidence="low",
             evidence=["AI response was malformed or incomplete"],
             short_explanation="Unable to determine root cause from AI response.",
-            is_mock=mock_mode,
+            provider_used="mock_fallback",
         )
     else:
-        diagnosis.is_mock = mock_mode
+        diagnosis.provider_used = provider_used
 
     # Verify against actual incident data
     verification = verify_evidence(diagnosis, incident)
@@ -448,15 +807,22 @@ def _format_amount(amount: float) -> str:
     return f"₹{formatted}.{decimal_part}"
 
 
-def run_demo() -> None:
-    """Run the AI diagnosis demo with the BANK_X UPI incident."""
+def run_demo(use_real_llm: bool = False) -> None:
+    """Run the AI diagnosis demo with the BANK_X UPI incident.
+
+    Args:
+        use_real_llm: If True, attempt real LLM API call (requires API key).
+                     If False (default), use mock provider.
+    """
     from payment_simulator import generate_bank_incident
     from incident_detector import detect_incidents, group_payments, format_amount
-    from recovery_plan import run_demo as run_plan_demo
 
     print()
     print("=" * 60)
-    print("  AI INCIDENT DIAGNOSIS — DEMO")
+    if use_real_llm:
+        print("  AI INCIDENT DIAGNOSIS — REAL LLM DEMO")
+    else:
+        print("  AI INCIDENT DIAGNOSIS — MOCK DEMO")
     print("=" * 60)
     print()
 
@@ -474,7 +840,7 @@ def run_demo() -> None:
     # Step 1: AI Diagnosis
     print("  STEP 1: AI Root Cause Analysis")
     print("  " + "─" * 50)
-    diagnosis, verification = diagnose_incident(incident, is_mock=True)
+    diagnosis, verification = diagnose_incident(incident, is_mock=not use_real_llm)
 
     print(f"  Affected Bank:    {incident['bank']}")
     print(f"  Method:           {incident['payment_method']}")
@@ -482,6 +848,14 @@ def run_demo() -> None:
     print(f"  Failed Payments:  {incident['failed_payments']}/{incident['total_payments']}")
     print(f"  Revenue At Risk:  {format_amount(incident['revenue_at_risk'])}")
     print()
+    # Map provider_used to display label
+    _provider_labels = {
+        "mock": "MOCK AI",
+        "real_llm": "REAL LLM",
+        "mock_fallback": "MOCK FALLBACK (real LLM failed)",
+    }
+    mode_label = _provider_labels.get(diagnosis.provider_used, diagnosis.provider_used)
+    print(f"  AI Provider:      [{mode_label}]")
     print(f"  AI Root Cause:    {diagnosis.likely_root_cause}")
     print(f"  Confidence:       {diagnosis.confidence.upper()}")
     print()
@@ -578,4 +952,13 @@ def run_demo() -> None:
 
 
 if __name__ == "__main__":
-    run_demo()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AI Incident Diagnosis Demo")
+    parser.add_argument(
+        "--real", action="store_true",
+        help="Use real LLM API (requires AI_DIAGNOSER_API_KEY env var)"
+    )
+    args = parser.parse_args()
+
+    run_demo(use_real_llm=args.real)
