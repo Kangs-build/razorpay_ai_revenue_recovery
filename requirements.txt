@@ -1,11 +1,10 @@
 # Razorpay AI Revenue Recovery — Python Dependencies
 # Track 3: AI Revenue Recovery
 #
-# Currently only uses the Python standard library (csv, collections, unittest).
-# Future versions may add:
-#   - pandas (data processing)
-#   - scikit-learn (anomaly detection)
-#   - openai / langchain (LLM integration)
-#   - razorpay (API integration)
+# Phase 1 (stdlib only):
+#   csv, collections, unittest, hashlib, hmac, json, urllib
+#
+# Phase 2 (webhook receiver + future dashboard):
+#   flask — lightweight HTTP API for webhook endpoint and dashboard
 
-# No external dependencies required for Phase 1.
+flask>=3.0
