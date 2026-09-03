@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+/* ─── Payment Intelligence Color System ─── */
+
+@theme {
+  --color-midnight: #0a0e1a;
+  --color-navy: #0f1629;
+  --color-navy-light: #151d35;
+  --color-navy-lighter: #1a2340;
+  --color-navy-card: #121a30;
+  --color-navy-border: #1e2a4a;
+  --color-navy-hover: #1e2a4a;
+
+  --color-text-primary: #e8eaf0;
+  --color-text-secondary: #8892a8;
+  --color-text-muted: #5a6478;
+  --color-text-dim: #3d4560;
+
+  --color-cyan: #00d4ff;
+  --color-cyan-dim: #00d4ff33;
+  --color-cyan-glow: #00d4ff20;
+
+  --color-emerald: #00e68a;
+  --color-emerald-dim: #00e68a33;
+  --color-emerald-glow: #00e68a18;
+
+  --color-amber: #ffb020;
+  --color-amber-dim: #ffb02033;
+  --color-amber-glow: #ffb02018;
+
+  --color-coral: #ff4d6a;
+  --color-coral-dim: #ff4d6a33;
+  --color-coral-glow: #ff4d6a18;
+
+  --color-purple: #a855f7;
+  --color-purple-dim: #a855f733;
+
+  --color-surface: #0f1629;
+  --color-surface-elevated: #151d35;
+  --color-border-subtle: #1e2a4a;
+  --color-border-active: #2a3660;
+}
+
+/* ─── Base ─── */
+
+html {
+  background: var(--color-midnight);
+  color: var(--color-text-primary);
+  font-family: 'Inter', 'SF Pro Display', -apple-system, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--color-midnight);
+}
+
+/* ─── Scrollbar ─── */
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--color-navy); }
+::-webkit-scrollbar-thumb { background: var(--color-navy-border); border-radius: 3px; }
+
+/* ─── Glow effects ─── */
+
+.glow-cyan {
+  box-shadow: 0 0 20px var(--color-cyan-glow), 0 0 40px var(--color-cyan-glow);
+}
+
+.glow-emerald {
+  box-shadow: 0 0 20px var(--color-emerald-glow), 0 0 40px var(--color-emerald-glow);
+}
+
+.glow-amber {
+  box-shadow: 0 0 20px var(--color-amber-glow), 0 0 40px var(--color-amber-glow);
+}
+
+.glow-coral {
+  box-shadow: 0 0 20px var(--color-coral-glow), 0 0 40px var(--color-coral-glow);
+}
+
+/* ─── Payment pulse animation ─── */
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); opacity: 1; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+.pulse-ring {
+  animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+}
+
+/* ─── Card glass effect ─── */
+
+.card-glass {
+  background: linear-gradient(135deg, rgba(21, 29, 53, 0.8) 0%, rgba(15, 22, 41, 0.9) 100%);
+  border: 1px solid var(--color-navy-border);
+  backdrop-filter: blur(12px);
+}
+
+.card-glass-active {
+  background: linear-gradient(135deg, rgba(21, 29, 53, 0.95) 0%, rgba(15, 22, 41, 0.98) 100%);
+  border: 1px solid var(--color-border-active);
+  backdrop-filter: blur(12px);
+}
+
+/* ─── Score bar ─── */
+
+.score-bar {
+  background: linear-gradient(90deg, var(--color-cyan) 0%, var(--color-emerald) 100%);
+  border-radius: 999px;
+  transition: width 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ─── Transaction line ─── */
+
+.tx-line {
+  background: linear-gradient(180deg, var(--color-cyan) 0%, transparent 100%);
+  width: 1px;
+}
+
+/* ─── Plan selected highlight ─── */
+
+.plan-selected {
+  border-color: var(--color-emerald);
+  box-shadow: 0 0 0 1px var(--color-emerald), 0 0 24px var(--color-emerald-glow), 0 0 48px var(--color-emerald-glow);
+}
+
+/* ─── Step flow arrows ─── */
+
+.step-arrow {
+  color: var(--color-text-dim);
+  font-size: 14px;
+}
