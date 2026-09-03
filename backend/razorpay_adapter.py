@@ -143,6 +143,7 @@ class InternalPayment:
             "customer_contact_count": self.customer_contact_count,
             "recovered_already": self.recovered_already,
             "last_recovery_attempt_time": self.last_recovery_attempt_time,
+            "created_at": self.created_at,
         }
         # Add _dt for compatibility with incident_detector's group_payments()
         if self.created_at:

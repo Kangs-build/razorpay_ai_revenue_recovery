@@ -112,9 +112,9 @@ def detect_incidents(
 ) -> list[dict]:
     """Detect incidents by sliding a time window over each (bank, method) group.
 
-    The window is anchored to the earliest payment in the group and spans
-    `time_window_minutes` forward. Only payments inside this window are
-    considered when computing the failure rate.
+    The window starts at the earliest payment and spans `time_window_minutes`
+    forward. After finding an incident, the window slides past it to check
+    for additional separate incidents in later time periods.
 
     A group is flagged when:
       - enough failed payments fall inside the window
@@ -127,44 +127,75 @@ def detect_incidents(
         if not all_payments:
             continue
 
-        window_start = _window_start(all_payments)
-        window_end = window_start + timedelta(minutes=time_window_minutes)
+        # Sliding window: start at earliest payment, advance after each incident
+        slide_start = _window_start(all_payments)
 
-        # Collect payments that fall inside the sliding window
-        window_payments = [
-            p for p in all_payments if p["_dt"] <= window_end
-        ]
-        window_failed = [p for p in window_payments if p["status"] == "failed"]
-        window_total = len(window_payments)
-        window_fail_count = len(window_failed)
+        while True:
+            window_end = slide_start + timedelta(minutes=time_window_minutes)
 
-        # Need at least min_failure_count failures to consider an incident
-        if window_fail_count < min_failure_count:
-            continue
+            # Collect payments that fall inside the sliding window
+            window_payments = [
+                p for p in all_payments if slide_start <= p["_dt"] <= window_end
+            ]
+            window_failed = [
+                p for p in window_payments if p["status"] == "failed"
+            ]
+            window_total = len(window_payments)
+            window_fail_count = len(window_failed)
 
-        # Compute failure rate inside the window
-        failure_rate = (window_fail_count / window_total) * 100
+            # Need at least min_failure_count failures to consider an incident
+            if window_fail_count < min_failure_count:
+                # No incident here — advance the window past the last payment
+                # we just checked so we don't re-check the same ones.
+                # Find the next payment after this window.
+                remaining = [
+                    p for p in all_payments if p["_dt"] > window_end
+                ]
+                if not remaining:
+                    break
+                slide_start = remaining[0]["_dt"]
+                continue
 
-        if failure_rate < min_failure_rate:
-            continue
+            # Compute failure rate inside the window
+            failure_rate = (window_fail_count / window_total) * 100
 
-        # Find the dominant error among failed payments in the window
-        error_reason = _most_common_error(window_failed)
+            if failure_rate < min_failure_rate:
+                # Window didn't meet threshold — advance past the last payment
+                # in this window.
+                slide_start = window_payments[-1]["_dt"] + timedelta(seconds=1)
+                remaining = [
+                    p for p in all_payments if p["_dt"] >= slide_start
+                ]
+                if not remaining:
+                    break
+                slide_start = remaining[0]["_dt"]
+                continue
 
-        # Revenue at risk = sum of failed payment amounts inside the window
-        revenue_at_risk = sum(p["amount"] for p in window_failed)
+            # Found an incident
+            error_reason = _most_common_error(window_failed)
+            revenue_at_risk = sum(p["amount"] for p in window_failed)
 
-        incidents.append(
-            {
-                "bank": bank,
-                "payment_method": method,
-                "error_reason": error_reason,
-                "total_payments": window_total,
-                "failed_payments": window_fail_count,
-                "failure_rate": round(failure_rate, 1),
-                "revenue_at_risk": round(revenue_at_risk, 2),
-            }
-        )
+            incidents.append(
+                {
+                    "bank": bank,
+                    "payment_method": method,
+                    "error_reason": error_reason,
+                    "total_payments": window_total,
+                    "failed_payments": window_fail_count,
+                    "failure_rate": round(failure_rate, 1),
+                    "revenue_at_risk": round(revenue_at_risk, 2),
+                    "window_start": slide_start.isoformat(),
+                    "window_end": window_end.isoformat(),
+                }
+            )
+
+            # Slide past this window to look for the next incident
+            remaining = [
+                p for p in all_payments if p["_dt"] > window_end
+            ]
+            if not remaining:
+                break
+            slide_start = remaining[0]["_dt"]
 
     # Sort by failure rate (highest first)
     incidents.sort(key=lambda x: x["failure_rate"], reverse=True)
