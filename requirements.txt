@@ -8,3 +8,4 @@
 #   flask — lightweight HTTP API for webhook endpoint and dashboard
 
 flask>=3.0
+gunicorn>=21.0
